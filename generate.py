@@ -4,6 +4,7 @@
 
 import os, torch, random, cv2, torchvision, subprocess, librosa, datetime, tempfile, face_alignment
 import numpy as np
+os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'  # Disable albumentations regretable behavior
 import albumentations as A
 import albumentations.pytorch.transforms as A_pytorch
 
@@ -104,6 +105,8 @@ class InferenceAgent:
 
 		del state_dict
 
+	# Old code that takes images in float format
+	# Weaknesses: we have to process all the images at once, insane resources needed
 	def save_video(self, vid_target_recon: torch.Tensor, video_path: str, audio_path: str) -> str:
 		with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_video:
 			temp_filename = temp_video.name
@@ -120,6 +123,112 @@ class InferenceAgent:
 			else:
 				os.rename(temp_filename, video_path)
 			return video_path
+
+	# New code to save the frames, already in int format
+	def save_video_frames(self, video_frames: torch.Tensor, video_path: str, audio_path: str = None) -> str:
+		# video_frames is expected to be:
+		# - on CPU
+		# - dtype=torch.uint8
+		# - shape (T, H, W, C) if B=1 from decode, or (B, T, H, W, C) if B>1 from decode
+
+		# If video_frames is batched (B, T, H, W, C), select the first video.
+		# If your use case is to save all videos in a batch, you'll need to modify this part
+		# to loop and generate unique names.
+		if video_frames.ndim == 5: # Indicates (B, T, H, W, C)
+			if video_frames.shape[0] == 0: # Batch size is 0
+				print("Warning: No video frames to save (batch size is 0).")
+				# Create an empty file or handle as an error
+				open(video_path, 'w').close()
+				return video_path
+			vid_to_save = video_frames[0] # Taking the first video in the batch
+		elif video_frames.ndim == 4: # Indicates (T, H, W, C)
+			vid_to_save = video_frames
+		else:
+			raise ValueError(f"Unexpected video_frames shape: {video_frames.shape}. Expected 4 or 5 dims.")
+
+		if vid_to_save.shape[0] == 0: # Number of frames T is 0
+			print(f"Warning: No frames in the video to save for {video_path}.")
+			# torchvision.io.write_video might error on 0 frames, so create an empty file.
+			# Or, if ffmpeg is used later, it might also error.
+			# Let's ensure an empty mp4 is created to avoid downstream issues.
+			open(video_path, 'w').close() # Creates an empty file, not a valid mp4.
+										  # A more robust way is to write a minimal valid mp4,
+										  # or just return if no audio either.
+			if audio_path is None: # if no audio, we just created an empty file
+				return video_path
+			# If there's audio, ffmpeg might still work or error gracefully.
+
+		# Ensure tensor is on CPU and detached (though decode_latent should handle CPU)
+		vid_to_save = vid_to_save.detach().cpu()
+
+		with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_video_file_obj:
+			temp_video_filename = temp_video_file_obj.name
+
+		# Only write video if there are frames
+		if vid_to_save.shape[0] > 0: # T > 0
+			try:
+				# PyAV 14 needs an integer here, and you need torchvision 0.21.0 or newer
+				torchvision.io.write_video(temp_video_filename, vid_to_save, fps=int(self.opt.fps))
+			except Exception as e:
+				print(f"Error writing video with torchvision: {e}")
+				# Add this to print the full traceback for the torchvision error
+				import traceback
+				traceback.print_exc()
+				# Fallback or re-raise. If this fails, the temp_video_filename might be empty or corrupt.
+				# For robustness, ensure video_path is at least touched if audio processing is skipped.
+				if audio_path is None:
+					os.rename(temp_video_filename, video_path) # may move an empty/corrupt file
+				# Consider re-raising or specific error handling
+		else: # T == 0, temp_video_filename is just an empty file path from NamedTemporaryFile
+			  # We need to create it if it doesn't exist, or ensure ffmpeg can handle non-existent video input
+			open(temp_video_filename, 'w').close()
+
+		if audio_path is not None and os.path.exists(audio_path):
+			# Ensure video_path directory exists
+			os.makedirs(os.path.dirname(video_path) or '.', exist_ok=True)
+
+			# Check if temp_video_filename (source video) actually exists and is not empty
+			# ffmpeg might fail if the input video is empty or doesn't exist.
+			source_video_exists = os.path.exists(temp_video_filename) and os.path.getsize(temp_video_filename) > 0
+
+			if not source_video_exists and vid_to_save.shape[0] == 0:
+				# If no video frames AND no valid temp video, just copy audio if that's desired
+				# Or error, or produce silent video.
+				# For now, let's assume ffmpeg might handle a missing -i if it's just for audio.
+				# A safer ffmpeg command if video is empty:
+				# command = f"ffmpeg -i {audio_path} -c:a aac -shortest {video_path} -y" # Creates video with audio only
+				# However, the original command implies video is primary.
+				print(f"Warning: No video frames to combine with audio. Temp video file '{temp_video_filename}' might be empty or non-existent.")
+
+			with open(os.devnull, 'wb') as f_null:
+				# If temp_video_filename doesn't exist or is empty, ffmpeg might error.
+				# Add -loglevel error to suppress verbose output for cleaner logs.
+				command =  f"ffmpeg -loglevel error -i \"{temp_video_filename}\" -i \"{audio_path}\" -c:v copy -c:a aac -shortest \"{video_path}\" -y"
+				# Using -shortest will make the output duration the minimum of video and audio.
+				# If video is T=0, this might result in a 0-duration video or use audio duration.
+				# print(f"Executing FFmpeg command: {command}")
+				try:
+					subprocess.run(command, shell=True, stdout=f_null, stderr=subprocess.PIPE, check=False) # check=False to inspect result
+					# if result.returncode != 0:
+					#	  print(f"FFmpeg error:\n{result.stderr.decode()}")
+				except Exception as e:
+					print(f"Error during ffmpeg execution: {e}")
+					# If ffmpeg fails, video_path might not be created.
+					# We might want to copy temp_video_filename to video_path as a fallback if audio fails.
+					if not os.path.exists(video_path) and os.path.exists(temp_video_filename):
+						 os.rename(temp_video_filename, video_path)
+
+			if os.path.exists(temp_video_filename):
+				os.remove(temp_video_filename)
+		else:
+			# No audio, just rename the temp video file to the final video_path
+			if os.path.exists(temp_video_filename):
+				 os.rename(temp_video_filename, video_path)
+			elif not os.path.exists(video_path): # Ensure video_path exists even if empty
+				 open(video_path, 'w').close()
+
+		return video_path
+
 
 	@torch.no_grad()
 	def run_inference(
@@ -148,10 +257,12 @@ class InferenceAgent:
 			e_cfg_scale = e_cfg_scale,
 			emo 		= emo,
 			nfe			= nfe,
-			seed		= seed
-			)['d_hat']
+			seed		= seed,
+			ret_d_hat	= False  # Get the frames ready to be saved
+			)
+			#)['d_hat']  # Needed if ret_d_hat is True
 
-		res_video_path = self.save_video(d_hat, res_video_path, audio_path)
+		res_video_path = self.save_video_frames(d_hat, res_video_path, audio_path)
 		if verbose: print(f"> [Done] result saved at {res_video_path}")
 		return res_video_path
 
